@@ -10,14 +10,13 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 
 RESULTS_FILE = "results.txt"
 
-
-# 0. Utils: log in results.txt
+# LOG SYSTEM
 def write_result(text: str):
     with open(RESULTS_FILE, "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
 
-# 1. Init models (MTCNN + FaceNet)
+# INIT MODELS
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
@@ -25,10 +24,11 @@ mtcnn = MTCNN(image_size=160, device=device)
 facenet = InceptionResnetV1(pretrained="vggface2").eval().to(device)
 
 
-# 2. Extract embedding from ONE image
+
+# EXTRACT EMBEDDING
 def get_embedding(image_path: str):
     try:
-        img = Image.open(image_path).convert("RGB")
+        img = Image.open(image_path).convert("RGB")  # fixes RGBA PNG
     except Exception as e:
         print(f"Error opening {image_path}: {e}")
         write_result(f"Error opening {image_path}: {e}")
@@ -37,7 +37,6 @@ def get_embedding(image_path: str):
     print(f"\nLoaded: {image_path}, size={img.size}")
     write_result(f"\nLoaded: {image_path}, size={img.size}")
 
-    # detect face
     face = mtcnn(img)
 
     if face is None:
@@ -48,17 +47,12 @@ def get_embedding(image_path: str):
     face = face.to(device)
 
     with torch.no_grad():
-        emb = facenet(face.unsqueeze(0))  # (1, 512)
+        emb = facenet(face.unsqueeze(0))
 
-    return emb.squeeze(0).cpu()  # (512,)
+    return emb.squeeze(0).cpu()
 
 
-# 3. Build PERSON DATABASE from persons/
-#     persons/
-#       Alex/...
-#       Maria/...
-#       unknown_1/...
-# ----------------------------------------------------
+# BUILD DATABASE FROM persons
 def build_database(root: str = "persons"):
     db = {}
 
@@ -88,89 +82,81 @@ def build_database(root: str = "persons"):
                 person_embeddings.append(emb)
 
         if person_embeddings:
-            db[person_name] = torch.stack(person_embeddings, dim=0)  # (N,512)
+            db[person_name] = torch.stack(person_embeddings, dim=0)
             print(f" → {person_name}: {len(person_embeddings)} embeddings saved.")
             write_result(f" → {person_name}: {len(person_embeddings)} embeddings saved.")
 
-    print(f"\n DATABASE READY: {list(db.keys())}")
+    print(f"\nDATABASE READY: {list(db.keys())}")
     write_result(f"DATABASE READY: {list(db.keys())}")
     return db
 
 
-# 4. Compare face embedding with all persons
-#    return: best_name, best_distance
+# FACE RECOGNITION
 def recognize_face(embedding: torch.Tensor, database: dict):
     if not database:
         return None, float("inf")
 
     best_name = None
-    best_distance = float("inf")
+    best_dist = float("inf")
 
     for name, emb_list in database.items():
-        # emb_list: (N,512)
-        distances = torch.norm(emb_list - embedding, dim=1)  # (N,)
-        dist = torch.min(distances).item()
+        distances = torch.norm(emb_list - embedding, dim=1)
+        dist = distances.min().item()
 
-        if dist < best_distance:
-            best_distance = dist
+        if dist < best_dist:
+            best_dist = dist
             best_name = name
 
-    return best_name, best_distance
+    return best_name, best_dist
 
 
-# ----------------------------------------------------
-# 5. Save / update UNKNOWN person
-#    - daca seamana cu un unknown_X existent → adauga acolo
-#    - altfel → creeaza unknown_{n+1}
-# ----------------------------------------------------
+# SAVE OR MERGE UNKNOWN PERSON
 def save_unknown_person(
     embedding: torch.Tensor,
     image_path: str,
     database: dict,
     threshold_unknown: float = 0.9,
 ):
-    # Caută dacă seamănă cu un unknown_ existent
-    best_unknown = None
+    img = Image.open(image_path).convert("RGB")
+
+    # Try to match unknown persons
+    best_person = None
     best_dist = float("inf")
 
-    for name in database.keys():
-        if name.startswith("unknown_"):
-            distances = torch.norm(database[name] - embedding, dim=1)
-            dist = torch.min(distances).item()
-            if dist < best_dist:
-                best_dist = dist
-                best_unknown = name
+    for name, embeds in database.items():
+        distances = torch.norm(embeds - embedding, dim=1)
+        dist = distances.min().item()
 
-    # Daca este destul de aproape de un unknown existent -> actualizeaza acela
-    if best_unknown is not None and best_dist < threshold_unknown:
-        print(f"→ Same UNKNOWN person: {best_unknown} (dist={best_dist:.3f})")
-        write_result(f"→ Same UNKNOWN person: {best_unknown} (dist={best_dist:.3f})")
+        if dist < best_dist:
+            best_dist = dist
+            best_person = name
 
-        folder = os.path.join("persons", best_unknown)
+    # Merge with existing unknown
+    if best_person is not None and best_person.startswith("unknown_") and best_dist < threshold_unknown:
+        print(f"→ Same UNKNOWN person: {best_person} (dist={best_dist:.3f})")
+        write_result(f"→ Same UNKNOWN person: {best_person} (dist={best_dist:.3f})")
+
+        folder = os.path.join("persons", best_person)
         os.makedirs(folder, exist_ok=True)
 
-        # nume nou de fisier
-        count = sum(
-            1 for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))
-        )
-        new_img_name = os.path.join(folder, f"{count + 1}.jpg")
-        Image.open(image_path).save(new_img_name)
+        count = len([f for f in os.listdir(folder)
+                     if f.lower().endswith((".jpg", ".jpeg", ".png"))])
 
-        # adaugă embedding
-        database[best_unknown] = torch.cat(
-            [database[best_unknown], embedding.unsqueeze(0)], dim=0
-        )
-        return best_unknown
+        img.save(os.path.join(folder, f"{count + 1}.jpg"))
 
-    # Altfel -> cream un unknown nou
-    existing_unknowns = [p for p in database.keys() if p.startswith("unknown_")]
+        database[best_person] = torch.cat([database[best_person], embedding.unsqueeze(0)], dim=0)
+
+        return best_person
+
+    # Create new unknown
+    existing_unknowns = [name for name in database if name.startswith("unknown_")]
     next_id = len(existing_unknowns) + 1
     new_name = f"unknown_{next_id}"
 
-    new_folder = os.path.join("persons", new_name)
-    os.makedirs(new_folder, exist_ok=True)
+    folder = os.path.join("persons", new_name)
+    os.makedirs(folder, exist_ok=True)
 
-    Image.open(image_path).save(os.path.join(new_folder, "1.jpg"))
+    img.save(os.path.join(folder, "1.jpg"))
 
     database[new_name] = embedding.unsqueeze(0)
 
@@ -180,7 +166,7 @@ def save_unknown_person(
     return new_name
 
 
-# 6. Process faces/
+# PROCESS FACES FOLDER
 def process_faces(
     database: dict,
     folder: str = "faces",
@@ -207,29 +193,40 @@ def process_faces(
 
         emb = get_embedding(img_path)
 
-        # 1) Nu e fata
         if emb is None:
             print("- NO PERSON DETECTED")
             write_result("- NO PERSON DETECTED")
             continue
 
-        # 2) Cautam în baza de date
         name, dist = recognize_face(emb, database)
 
-        # daca baza e goala, name va fi None, dist = inf
+        # DB empty -> create unknown directly
         if name is None:
             print(f"+ UNKNOWN PERSON (no DB)")
             write_result(f"+ UNKNOWN PERSON (no DB)")
             save_unknown_person(emb, img_path, database, unknown_merge_threshold)
             continue
 
-        # 3) EXISTA persoana în DB și nu e unknown_ și dist < prag => persoana cunoscuta
+
+        # PERSON IDENTIFIED -> SAVE IMAGE & EMBEDDING
         if not name.startswith("unknown_") and dist < known_threshold:
             print(f"** PERSON IDENTIFIED: {name} (dist={dist:.3f})")
             write_result(f"** PERSON IDENTIFIED: {name} (dist={dist:.3f})")
+
+            person_folder = os.path.join("persons", name)
+            os.makedirs(person_folder, exist_ok=True)
+
+            count = len([f for f in os.listdir(person_folder)
+                         if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+
+            img = Image.open(img_path).convert("RGB")
+            img.save(os.path.join(person_folder, f"{count + 1}.jpg"))
+
+            database[name] = torch.cat([database[name], emb.unsqueeze(0)], dim=0)
+
             continue
 
-        # 4) Altfel: fata, dar nu e cunoscuta din DB
+        # UNKNOWN PERSON
         print(f"+ UNKNOWN PERSON (best match={name}, dist={dist:.3f})")
         write_result(f"+ UNKNOWN PERSON (best match={name}, dist={dist:.3f})")
 
@@ -238,7 +235,6 @@ def process_faces(
 
 # MAIN
 if __name__ == "__main__":
-    # ștergem log-ul vechi
     open(RESULTS_FILE, "w", encoding="utf-8").close()
 
     print("Building database from 'persons/' ...")
